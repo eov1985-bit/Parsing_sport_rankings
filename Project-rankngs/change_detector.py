@@ -285,7 +285,9 @@ class ChangeDetector:
 
         # Получаем конфиг источника
         source_info = await self._get_source_info(source_code)
-        pattern = SOURCE_PATTERNS.get(source_code, {})
+
+        # Приоритет: discovery_config из БД → SOURCE_PATTERNS (хардкод)
+        pattern = self._resolve_pattern(source_info, source_code)
 
         if not pattern:
             return CheckResult(
@@ -735,6 +737,52 @@ class ChangeDetector:
             if r:
                 return dict(r._mapping)
         return None
+
+    @staticmethod
+    def _resolve_pattern(source_info: Optional[dict], source_code: str) -> dict:
+        """
+        Приоритет конфигурации:
+        1. discovery_config из БД (registry_sources) — для источников, созданных через UI
+        2. SOURCE_PATTERNS (хардкод) — для legacy-источников
+
+        Конвертирует discovery_config (вложенная структура) в плоский формат pattern,
+        совместимый с _check_source_impl.
+        """
+        # 1) Пробуем discovery_config из БД
+        if source_info:
+            dc = source_info.get("discovery_config")
+            if dc and isinstance(dc, dict):
+                detect = dc.get("detect", {})
+                download = dc.get("download", {})
+
+                # discovery_config.detect содержит list_urls, link_regex и т.д.
+                if detect.get("list_urls"):
+                    pattern = {
+                        "list_urls": detect.get("list_urls", []),
+                        "link_regex": detect.get("link_regex", ""),
+                        "title_regex": detect.get("title_regex", ""),
+                        "order_date_regex": detect.get("order_date_regex", ""),
+                        "order_number_regex": detect.get("order_number_regex", ""),
+                        "pagination": detect.get("pagination"),
+                        "max_pages": detect.get("max_pages", 1),
+                        "js_var": detect.get("js_var"),
+                        "method": download.get("method", "httpx"),
+                        "source_type": source_info.get("source_type", "pdf_portal"),
+                        "base_url": download.get("base_url", ""),
+                        "antibot": download.get("antibot"),
+                        "wait_selector": download.get("wait_selector"),
+                    }
+                    logger.debug(
+                        f"[{source_code}] конфиг загружен из БД (discovery_config), "
+                        f"{len(pattern['list_urls'])} URL"
+                    )
+                    return pattern
+
+        # 2) Fallback: хардкод SOURCE_PATTERNS
+        pattern = SOURCE_PATTERNS.get(source_code, {})
+        if pattern:
+            logger.debug(f"[{source_code}] конфиг из SOURCE_PATTERNS (хардкод)")
+        return pattern
 
     async def _get_active_source_codes(self) -> list[str]:
         """Возвращает коды активных источников из БД."""

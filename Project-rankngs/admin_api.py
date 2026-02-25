@@ -211,6 +211,7 @@ class SourceCreate(BaseModel):
     risk_class: str = "green"
     active: bool = False  # новые источники отключены по умолчанию
     official_basis: Optional[str] = None
+    inn: Optional[int] = None  # ИНН организации для внешнего API-обмена
 
     # Download config
     download_method: str = "httpx"          # httpx | playwright
@@ -401,10 +402,10 @@ async def create_source(body: SourceCreate):
     await execute("""
         INSERT INTO registry_sources
             (code, name, region, federal_subject, source_type,
-             discovery_config, official_basis, risk_class, active)
+             discovery_config, official_basis, risk_class, active, inn)
         VALUES
             (:code, :name, :region, :fs, :st,
-             :config::jsonb, :ob, :rc, :active)
+             :config::jsonb, :ob, :rc, :active, :inn)
     """, {
         "code": body.code,
         "name": body.name,
@@ -415,6 +416,7 @@ async def create_source(body: SourceCreate):
         "ob": body.official_basis,
         "rc": body.risk_class,
         "active": body.active,
+        "inn": body.inn,
     })
 
     # Регистрируем домен в SSRF-allowlist (без перезапуска)
@@ -444,7 +446,7 @@ async def update_source_full(code: str, body: SourceCreate):
             name = :name, region = :region, federal_subject = :fs,
             source_type = :st, discovery_config = :config::jsonb,
             official_basis = :ob, risk_class = :rc, active = :active,
-            updated_at = NOW()
+            inn = :inn, updated_at = NOW()
         WHERE code = :code
     """, {
         "code": code,
@@ -456,6 +458,7 @@ async def update_source_full(code: str, body: SourceCreate):
         "ob": body.official_basis,
         "rc": body.risk_class,
         "active": body.active,
+        "inn": body.inn,
     })
 
     # Регистрируем домен в SSRF-allowlist (без перезапуска)
@@ -1149,3 +1152,364 @@ async def health():
         return {"status": "ok", "db": "connected"}
     except Exception as e:
         return {"status": "degraded", "db": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Утилита: разбиение ФИО на компоненты
+# ---------------------------------------------------------------------------
+
+def split_fio(fio: str) -> dict:
+    """
+    Разбивает строку ФИО на lastName, firstName, middleName.
+    Примеры:
+        "Иванов Иван Иванович"  → {"lastName":"Иванов","firstName":"Иван","middleName":"Иванович"}
+        "Петрова Мария"         → {"lastName":"Петрова","firstName":"Мария","middleName":null}
+        "Ким Чен Ир оглы"      → {"lastName":"Ким","firstName":"Чен","middleName":"Ир оглы"}
+    """
+    if not fio:
+        return {"lastName": None, "firstName": None, "middleName": None}
+
+    parts = fio.strip().split()
+    if len(parts) == 0:
+        return {"lastName": None, "firstName": None, "middleName": None}
+    elif len(parts) == 1:
+        return {"lastName": parts[0], "firstName": None, "middleName": None}
+    elif len(parts) == 2:
+        return {"lastName": parts[0], "firstName": parts[1], "middleName": None}
+    else:
+        return {"lastName": parts[0], "firstName": parts[1], "middleName": " ".join(parts[2:])}
+
+
+# ---------------------------------------------------------------------------
+# External API Exchange — формат для информационной системы-потребителя
+# ---------------------------------------------------------------------------
+
+class ExchangeFilter(BaseModel):
+    """Фильтры для выгрузки в обменном формате."""
+    source_code: Optional[str] = None
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+    status: Optional[str] = "approved"
+
+
+@app.get("/api/exchange/orders")
+async def exchange_orders(
+    source_code: Optional[str] = Query(None),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+    status: str = Query("approved"),
+    limit: int = Query(100, le=1000),
+    offset: int = Query(0),
+):
+    """
+    Выгрузка приказов в обменном JSON-формате для внешней ИС.
+
+    Формат:
+    [
+      {
+        "order": "123",
+        "issueDate": "2010-12-31",
+        "issuedBy": 1234567890,  // ИНН
+        "signedBy": "Сидоров С.С.",
+        "assignment": true,
+        "file": "base64...",
+        "items": [
+          {
+            "lastName": "Петров",
+            "firstName": "Пётр",
+            "middleName": "Петрович",
+            "birthDate": "2000-12-31",
+            "sport": "плавание",
+            "rank": "КМС"
+          }
+        ]
+      }
+    ]
+    """
+    # Собираем WHERE-условия
+    where_parts = ["o.status = :status"]
+    params = {"status": status, "lim": limit, "off": offset}
+
+    if source_code:
+        where_parts.append("rs.code = :src")
+        params["src"] = source_code
+    if date_from:
+        where_parts.append("o.order_date >= :df::date")
+        params["df"] = date_from
+    if date_to:
+        where_parts.append("o.order_date <= :dt::date")
+        params["dt"] = date_to
+
+    where_sql = " AND ".join(where_parts)
+
+    orders_rows = await fetch_all(f"""
+        SELECT
+            o.id, o.order_number, o.order_date, o.signed_by,
+            o.file_hash, o.order_type, o.title,
+            rs.inn, rs.code as source_code, rs.name as source_name
+        FROM orders o
+        JOIN registry_sources rs ON o.source_id = rs.id
+        WHERE {where_sql}
+        ORDER BY o.order_date DESC
+        LIMIT :lim OFFSET :off
+    """, params)
+
+    result = []
+    for orow in orders_rows:
+        order_id = orow["id"]
+
+        # Записи присвоения для данного приказа
+        assignments = await fetch_all("""
+            SELECT fio, birth_date, sport, rank_category, action
+            FROM assignments
+            WHERE order_id = :oid
+            ORDER BY created_at
+        """, {"oid": order_id})
+
+        items = []
+        has_assignment = False
+        for a in assignments:
+            fio_parts = split_fio(a["fio"])
+
+            bd = a.get("birth_date")
+            birth_str = None
+            if bd:
+                if isinstance(bd, date):
+                    birth_str = bd.isoformat()
+                elif isinstance(bd, str) and len(bd) == 10:
+                    birth_str = bd
+                elif isinstance(bd, str):
+                    # DD.MM.YYYY → YYYY-MM-DD
+                    try:
+                        parts = bd.split(".")
+                        if len(parts) == 3:
+                            birth_str = f"{parts[2]}-{parts[1]}-{parts[0]}"
+                    except Exception:
+                        birth_str = bd
+
+            if a.get("action") == "assignment":
+                has_assignment = True
+
+            items.append({
+                "lastName": fio_parts["lastName"],
+                "firstName": fio_parts["firstName"],
+                "middleName": fio_parts["middleName"],
+                "birthDate": birth_str,
+                "sport": a.get("sport"),
+                "rank": a.get("rank_category"),
+            })
+
+        od = orow.get("order_date")
+        issue_date = None
+        if od:
+            if isinstance(od, date):
+                issue_date = od.isoformat()
+            elif isinstance(od, str) and len(od) >= 10:
+                issue_date = od[:10]
+
+        result.append({
+            "order": orow.get("order_number"),
+            "issueDate": issue_date,
+            "issuedBy": orow.get("inn"),
+            "signedBy": orow.get("signed_by"),
+            "assignment": has_assignment,
+            "file": None,  # Base64 — заполняется при наличии файла в хранилище
+            "items": items,
+        })
+
+    return result
+
+
+@app.get("/api/exchange/orders/{order_id}")
+async def exchange_order_single(order_id: str):
+    """
+    Один приказ в обменном формате (с Base64 файлом при наличии).
+    """
+    import base64
+
+    orow = await fetch_one("""
+        SELECT o.*, rs.inn, rs.code as source_code
+        FROM orders o
+        JOIN registry_sources rs ON o.source_id = rs.id
+        WHERE o.id = :oid::uuid
+    """, {"oid": order_id})
+
+    if not orow:
+        raise HTTPException(404, "Order not found")
+
+    assignments = await fetch_all("""
+        SELECT fio, birth_date, sport, rank_category, action
+        FROM assignments WHERE order_id = :oid
+        ORDER BY created_at
+    """, {"oid": order_id})
+
+    items = []
+    has_assignment = False
+    for a in assignments:
+        fio_parts = split_fio(a["fio"])
+        bd = a.get("birth_date")
+        birth_str = None
+        if bd:
+            if isinstance(bd, date):
+                birth_str = bd.isoformat()
+            elif isinstance(bd, str):
+                try:
+                    parts = bd.split(".")
+                    if len(parts) == 3:
+                        birth_str = f"{parts[2]}-{parts[1]}-{parts[0]}"
+                    else:
+                        birth_str = bd
+                except Exception:
+                    birth_str = bd
+
+        if a.get("action") == "assignment":
+            has_assignment = True
+
+        items.append({
+            "lastName": fio_parts["lastName"],
+            "firstName": fio_parts["firstName"],
+            "middleName": fio_parts["middleName"],
+            "birthDate": birth_str,
+            "sport": a.get("sport"),
+            "rank": a.get("rank_category"),
+        })
+
+    # Попытка загрузить PDF
+    file_b64 = None
+    file_hash = orow.get("file_hash")
+    if file_hash:
+        pdf_dir = os.environ.get("PDF_STORAGE_DIR", "./pdf_storage")
+        source_code = orow.get("source_code", "unknown")
+        # Поиск по нескольким возможным путям
+        for candidate in [
+            os.path.join(pdf_dir, source_code, f"{file_hash}.pdf"),
+            os.path.join(pdf_dir, f"{file_hash}.pdf"),
+        ]:
+            if os.path.exists(candidate):
+                with open(candidate, "rb") as f:
+                    file_b64 = base64.b64encode(f.read()).decode("ascii")
+                break
+
+    od = orow.get("order_date")
+    issue_date = od.isoformat() if isinstance(od, date) else (od[:10] if od else None)
+
+    return {
+        "order": orow.get("order_number"),
+        "issueDate": issue_date,
+        "issuedBy": orow.get("inn"),
+        "signedBy": orow.get("signed_by"),
+        "assignment": has_assignment,
+        "file": file_b64,
+        "items": items,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Metrics / KPI — операционные метрики для дашборда и мониторинга
+# ---------------------------------------------------------------------------
+
+@app.get("/api/metrics")
+async def get_metrics():
+    """
+    Операционные метрики для UI-дашборда и внешних систем мониторинга.
+    Возвращает KPIs: throughput, latency, error rates, backlog.
+    """
+    # Pipeline throughput
+    throughput = await fetch_all("""
+        SELECT
+            DATE(extracted_at) as dt,
+            COUNT(*) as orders_processed,
+            SUM(page_count) as pages_total,
+            AVG(page_count) as avg_pages,
+            AVG(ocr_confidence) as avg_confidence
+        FROM orders
+        WHERE extracted_at IS NOT NULL
+          AND extracted_at > NOW() - interval '30 days'
+        GROUP BY DATE(extracted_at)
+        ORDER BY dt DESC
+        LIMIT 30
+    """)
+
+    # Backlog
+    backlog = await fetch_one("""
+        SELECT
+            COUNT(*) FILTER (WHERE status = 'new') as queue_new,
+            COUNT(*) FILTER (WHERE status = 'downloaded') as queue_downloaded,
+            COUNT(*) FILTER (WHERE status = 'failed') as queue_failed,
+            COUNT(*) FILTER (WHERE status = 'extracted') as pending_review,
+            COUNT(*) FILTER (WHERE status = 'approved') as approved_total,
+            MIN(created_at) FILTER (WHERE status = 'new') as oldest_new
+        FROM orders
+    """)
+
+    # Error rates by source (last 7 days)
+    error_rates = await fetch_all("""
+        SELECT
+            rs.code,
+            rs.name,
+            rs.risk_class,
+            COUNT(*) FILTER (WHERE o.status = 'extracted') as ok,
+            COUNT(*) FILTER (WHERE o.status = 'failed') as failed,
+            CASE
+                WHEN COUNT(*) > 0
+                THEN ROUND(100.0 * COUNT(*) FILTER (WHERE o.status = 'failed') / COUNT(*), 1)
+                ELSE 0
+            END as fail_pct
+        FROM registry_sources rs
+        LEFT JOIN orders o ON o.source_id = rs.id
+            AND o.created_at > NOW() - interval '7 days'
+        WHERE rs.active = TRUE
+        GROUP BY rs.id
+        ORDER BY fail_pct DESC
+    """)
+
+    # OCR performance (last 7 days)
+    ocr_stats = await fetch_one("""
+        SELECT
+            COUNT(*) as total_orders,
+            SUM(page_count) as total_pages,
+            AVG(ocr_confidence) as avg_confidence,
+            MIN(ocr_confidence) as min_confidence,
+            COUNT(*) FILTER (WHERE ocr_confidence < 0.6) as low_confidence_count,
+            COUNT(*) FILTER (WHERE ocr_method = 'tesseract') as tesseract_count,
+            COUNT(*) FILTER (WHERE ocr_method = 'pypdf') as pypdf_count
+        FROM orders
+        WHERE extracted_at > NOW() - interval '7 days'
+    """)
+
+    # Assignment stats
+    assign_stats = await fetch_one("""
+        SELECT
+            COUNT(*) as total,
+            COUNT(DISTINCT sport) as unique_sports,
+            COUNT(DISTINCT fio_normalized) as unique_persons,
+            COUNT(*) FILTER (WHERE assignment_type = 'sport_rank') as ranks,
+            COUNT(*) FILTER (WHERE assignment_type = 'judge_category') as judges,
+            COUNT(*) FILTER (WHERE action = 'assignment') as assignments,
+            COUNT(*) FILTER (WHERE action = 'confirmation') as confirmations,
+            COUNT(*) FILTER (WHERE action = 'refusal') as refusals,
+            AVG(confidence) as avg_extraction_confidence
+        FROM assignments
+        WHERE created_at > NOW() - interval '30 days'
+    """)
+
+    # Exchange readiness — сколько приказов готовы к выгрузке
+    exchange_ready = await fetch_one("""
+        SELECT
+            COUNT(*) as ready,
+            COUNT(*) FILTER (WHERE rs.inn IS NOT NULL) as with_inn,
+            COUNT(*) FILTER (WHERE o.signed_by IS NOT NULL) as with_signer
+        FROM orders o
+        JOIN registry_sources rs ON o.source_id = rs.id
+        WHERE o.status = 'approved'
+    """)
+
+    return {
+        "timestamp": datetime.utcnow().isoformat(),
+        "throughput": throughput or [],
+        "backlog": backlog or {},
+        "error_rates": error_rates or [],
+        "ocr": ocr_stats or {},
+        "assignments": assign_stats or {},
+        "exchange_readiness": exchange_ready or {},
+    }
