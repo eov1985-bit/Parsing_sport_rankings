@@ -1,0 +1,110 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: sportrank
+      POSTGRES_USER: sportrank
+      POSTGRES_PASSWORD: sportrank
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sportrank"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://sportrank:sportrank@db:5432/sportrank
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
+      PDF_OUTPUT_DIR: /app/pdfs
+      GOLDEN_SET_DIR: /app/golden
+      # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes:
+      - pdfs:/app/pdfs
+      - golden:/app/golden
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # ---- Worker: обрабатывает очередь orders (OCR → extract → normalize → save) ----
+  worker:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://sportrank:sportrank@db:5432/sportrank
+      PDF_OUTPUT_DIR: /app/pdfs
+      WORKER_LIMIT: ${WORKER_LIMIT:-50}
+      WORKER_SLEEP_SEC: ${WORKER_SLEEP_SEC:-30}
+      # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes:
+      - pdfs:/app/pdfs
+      - ./data:/app/data
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+    command:
+      - bash
+      - -lc
+      - |
+        echo "[worker] Pipeline worker started (limit=$$WORKER_LIMIT, sleep=$$WORKER_SLEEP_SEC)"
+        while true; do
+          python pipeline_orchestrator.py process-pending \
+            --db "$$DATABASE_URL" \
+            --limit "$$WORKER_LIMIT" 2>&1 || true
+          sleep "$$WORKER_SLEEP_SEC"
+        done
+    restart: unless-stopped
+
+  # ---- Scheduler: обнаружение новых приказов через change_detector ----
+  scheduler:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://sportrank:sportrank@db:5432/sportrank
+      SCHEDULER_SLEEP_SEC: ${SCHEDULER_SLEEP_SEC:-300}
+    volumes:
+      - ./data:/app/data
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    command:
+      - bash
+      - -lc
+      - |
+        echo "[scheduler] Change detector started (sleep=$$SCHEDULER_SLEEP_SEC)"
+        while true; do
+          python change_detector.py check-all --db "$$DATABASE_URL" 2>&1 || true
+          sleep "$$SCHEDULER_SLEEP_SEC"
+        done
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  pdfs:
+  golden:

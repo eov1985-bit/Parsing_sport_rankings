@@ -1,0 +1,37 @@
+# SportRank — зависимости
+# Установка: pip install -r requirements.txt
+
+# === Web Framework ===
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+pyjwt==2.10.0
+
+# === Database ===
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+
+# === PDF / OCR ===
+pypdf==5.2.0
+pdf2image==1.17.0
+pytesseract==0.3.13
+# opencv-python-headless==4.10.0.84  # опционально, для улучшения OCR
+
+# === HTTP / Network ===
+httpx==0.28.0
+tenacity==9.0.0
+
+# === Справочники ===
+openpyxl==3.1.5
+rapidfuzz==3.10.0
+
+# === Playwright (для amber-источников, опционально) ===
+# playwright==1.49.0
+# После установки: playwright install chromium
+
+# === LLM (ОПЦИОНАЛЬНО — закомментировано для безLLM-варианта) ===
+# anthropic>=0.40.0
+
+# === Dev / Test ===
+# pytest==8.3.0
+# pytest-asyncio==0.24.0
+# ruff==0.8.0
